@@ -4,11 +4,14 @@
 Pipeline
 --------
 - One long-lived process per GPU; each GPU owns one WSI until completion.
-- CPU threads only decode 512x512 level-0 patches with OpenSlide.
+- CPU threads directly decode the physical 512x512 JPEG tiles from TIFF level-0.
+  OpenSlide is not used in the extraction path.
 - GPU performs bicubic 512->256 resize, 224 center crop, normalization, and inference.
 - CPU/GPU handoff uses a bounded pinned-memory queue with backpressure.
 - First non-empty WSI on each GPU validates GPU preprocessing against the prior
   PIL CPU preprocessing path; the WSI aborts if feature cosine is too low.
+- Each WSI is strictly validated before extraction: tiled TIFF, 512x512 tiles,
+  JPEG compression, contiguous 3-channel samples, and 512-aligned coordinates.
 - Existing .pt outputs are skipped unless --overwrite is supplied.
 - Progress is rendered in-place as a fixed terminal dashboard when stdout is a TTY.
 """
@@ -17,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import queue
 import shutil
@@ -39,6 +43,13 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+try:
+    import tifffile
+except ImportError as exc:
+    raise RuntimeError(
+        "tifffile is required for direct physical TIFF tile decoding."
+    ) from exc
+
 MODEL_REPO = "prov-gigapath/prov-gigapath-flash"
 FEATURE_DIM = 384
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -48,6 +59,7 @@ LEVEL0_READ_SIZE = 512
 RESIZE_SIZE = 256
 MODEL_INPUT_SIZE = 224
 CROP_OFFSET = (RESIZE_SIZE - MODEL_INPUT_SIZE) // 2
+JPEG_COMPRESSION_CODE = 7
 
 _END = object()
 _READER_TLS = threading.local()
@@ -95,6 +107,15 @@ class StagedBatch:
     payload: BatchPayload
     images_gpu: torch.Tensor
     ready_event: torch.cuda.Event
+
+
+@dataclass
+class DirectTiffReader:
+    tif: Any
+    page: Any
+    filehandle: Any
+    tiles_x: int
+    tiles_y: int
 
 
 def parse_gpu_ids(text: str) -> list[int]:
@@ -204,18 +225,111 @@ def load_coords(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return arr[:, :2], arr[:, 2:4]
 
 
-def _init_slide_reader(slide_path: str) -> None:
+def _compression_code(page: Any) -> int:
     try:
-        import openslide
-    except ImportError as exc:
-        raise RuntimeError(
-            "openslide-python and the system OpenSlide library are required."
-        ) from exc
+        return int(page.compression)
+    except (TypeError, ValueError):
+        return int(page.compression.value)
 
-    reader = openslide.OpenSlide(slide_path)
+
+def _planarconfig_code(page: Any) -> int:
+    try:
+        return int(page.planarconfig)
+    except (TypeError, ValueError):
+        return int(page.planarconfig.value)
+
+
+def _validate_direct_tiff_source(
+    slide_path: str,
+    coords_l0: np.ndarray,
+) -> dict[str, int]:
+    """Fail fast unless direct physical-tile decoding is semantically safe."""
+    if len(coords_l0):
+        misaligned = np.any(coords_l0 % LEVEL0_READ_SIZE != 0, axis=1)
+        n_bad = int(misaligned.sum())
+        if n_bad:
+            raise RuntimeError(
+                f"Direct TIFF reader requires {LEVEL0_READ_SIZE}-aligned level-0 "
+                f"coordinates, but found {n_bad} misaligned patches in {slide_path}."
+            )
+
+    with tifffile.TiffFile(slide_path) as tif:
+        page = tif.pages[0]
+        if not page.is_tiled:
+            raise RuntimeError(f"Level-0 is not tiled: {slide_path}")
+
+        tw = int(page.tilewidth)
+        th = int(page.tilelength)
+        if (tw, th) != (LEVEL0_READ_SIZE, LEVEL0_READ_SIZE):
+            raise RuntimeError(
+                f"Direct TIFF reader requires 512x512 physical tiles, got "
+                f"{tw}x{th}: {slide_path}"
+            )
+
+        compression = _compression_code(page)
+        if compression != JPEG_COMPRESSION_CODE:
+            raise RuntimeError(
+                f"Direct TIFF reader requires JPEG compression (7), got "
+                f"{compression}: {slide_path}"
+            )
+
+        spp = int(page.samplesperpixel)
+        if spp != 3:
+            raise RuntimeError(
+                f"Direct TIFF reader requires 3 samples/pixel, got {spp}: {slide_path}"
+            )
+
+        planar = _planarconfig_code(page)
+        if planar != 1:
+            raise RuntimeError(
+                f"Direct TIFF reader requires contiguous samples (PlanarConfig=1), "
+                f"got {planar}: {slide_path}"
+            )
+
+        tiles_x = math.ceil(int(page.imagewidth) / tw)
+        tiles_y = math.ceil(int(page.imagelength) / th)
+        expected_tiles = tiles_x * tiles_y
+        actual_tiles = len(page.dataoffsets)
+        if actual_tiles < expected_tiles:
+            raise RuntimeError(
+                f"TIFF tile table is shorter than expected: {actual_tiles} < "
+                f"{expected_tiles}: {slide_path}"
+            )
+
+        if len(coords_l0):
+            tx = coords_l0[:, 0] // tw
+            ty = coords_l0[:, 1] // th
+            bad_bounds = (tx < 0) | (ty < 0) | (tx >= tiles_x) | (ty >= tiles_y)
+            n_bad_bounds = int(bad_bounds.sum())
+            if n_bad_bounds:
+                raise RuntimeError(
+                    f"Found {n_bad_bounds} coordinates outside the physical tile grid "
+                    f"{tiles_x}x{tiles_y}: {slide_path}"
+                )
+
+        return {
+            "tile_width": tw,
+            "tile_height": th,
+            "tiles_x": tiles_x,
+            "tiles_y": tiles_y,
+            "compression": compression,
+        }
+
+
+def _init_tiff_reader(slide_path: str) -> None:
+    """Create one independent TiffFile/filehandle per parser thread."""
+    tif = tifffile.TiffFile(slide_path)
+    page = tif.pages[0]
+    reader = DirectTiffReader(
+        tif=tif,
+        page=page,
+        filehandle=tif.filehandle,
+        tiles_x=math.ceil(int(page.imagewidth) / int(page.tilewidth)),
+        tiles_y=math.ceil(int(page.imagelength) / int(page.tilelength)),
+    )
     _READER_TLS.reader = reader
     with _READER_REGISTRY_LOCK:
-        _READER_REGISTRY.append(reader)
+        _READER_REGISTRY.append(tif)
 
 
 def _close_registered_readers() -> None:
@@ -230,25 +344,82 @@ def _close_registered_readers() -> None:
             pass
 
 
-def _read_raw_patch_into(dest: torch.Tensor, x_l0: int, y_l0: int) -> None:
-    reader = getattr(_READER_TLS, "reader", None)
+def _read_physical_tile_into(dest: torch.Tensor, x_l0: int, y_l0: int) -> None:
+    """Decode exactly one level-0 JPEG TIFF tile directly into CHW uint8."""
+    reader: Optional[DirectTiffReader] = getattr(_READER_TLS, "reader", None)
     if reader is None:
-        raise RuntimeError("OpenSlide reader was not initialized in parser thread")
+        raise RuntimeError("Direct TIFF reader was not initialized in parser thread")
 
-    rgba = reader.read_region(
-        (int(x_l0), int(y_l0)),
-        0,
-        (LEVEL0_READ_SIZE, LEVEL0_READ_SIZE),
+    page = reader.page
+    tw = int(page.tilewidth)
+    th = int(page.tilelength)
+
+    if x_l0 % tw or y_l0 % th:
+        raise RuntimeError(
+            f"Coordinate ({x_l0},{y_l0}) is not aligned to physical tile {tw}x{th}"
+        )
+
+    tx = x_l0 // tw
+    ty = y_l0 // th
+    if tx < 0 or ty < 0 or tx >= reader.tiles_x or ty >= reader.tiles_y:
+        raise RuntimeError(
+            f"Coordinate ({x_l0},{y_l0}) maps outside TIFF tile grid "
+            f"{reader.tiles_x}x{reader.tiles_y}"
+        )
+
+    index = ty * reader.tiles_x + tx
+    offset = int(page.dataoffsets[index])
+    bytecount = int(page.databytecounts[index])
+
+    fh = reader.filehandle
+    fh.seek(offset)
+    encoded = fh.read(bytecount)
+    if len(encoded) != bytecount:
+        raise RuntimeError(
+            f"Short TIFF tile read at index {index}: got {len(encoded)} bytes, "
+            f"expected {bytecount}"
+        )
+
+    decoded, _, _ = page.decode(
+        encoded,
+        index,
+        jpegtables=page.jpegtables,
     )
+    if decoded is None:
+        raise RuntimeError(f"TIFF decoder returned None for physical tile {index}")
 
-    if rgba.mode == "RGBA":
-        rgb = Image.new("RGB", rgba.size, (255, 255, 255))
-        rgb.paste(rgba, mask=rgba.getchannel("A"))
-    else:
-        rgb = rgba.convert("RGB")
+    arr = np.asarray(decoded)
+    while arr.ndim > 3 and arr.shape[0] == 1:
+        arr = arr[0]
 
-    arr = np.array(rgb, dtype=np.uint8, copy=True)
-    dest.copy_(torch.from_numpy(np.ascontiguousarray(arr.transpose(2, 0, 1))))
+    expected_shape = (LEVEL0_READ_SIZE, LEVEL0_READ_SIZE, 3)
+    if arr.shape != expected_shape:
+        raise RuntimeError(
+            f"Unexpected decoded tile shape {arr.shape} at index {index}; "
+            f"expected {expected_shape}"
+        )
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8, copy=False)
+
+    chw = np.ascontiguousarray(arr.transpose(2, 0, 1))
+    dest.copy_(torch.from_numpy(chw))
+
+
+def _read_physical_tile_chunk(
+    images: torch.Tensor,
+    coords_l0: np.ndarray,
+    batch_start: int,
+    local_start: int,
+    local_end: int,
+) -> None:
+    """Decode a contiguous chunk to reduce Python Future scheduling overhead."""
+    for i in range(local_start, local_end):
+        coord_i = batch_start + i
+        _read_physical_tile_into(
+            images[i],
+            int(coords_l0[coord_i, 0]),
+            int(coords_l0[coord_i, 1]),
+        )
 
 
 def _put_with_backpressure(
@@ -282,14 +453,15 @@ def _produce_raw_batches(
         _close_registered_readers()
         with ThreadPoolExecutor(
             max_workers=parser_threads,
-            thread_name_prefix="patch-reader",
-            initializer=_init_slide_reader,
+            thread_name_prefix="tiff-tile-reader",
+            initializer=_init_tiff_reader,
             initargs=(slide_path,),
         ) as pool:
             n = len(coords_l0)
             for start in range(0, n, batch_size):
                 if stop_event.is_set():
                     break
+
                 end = min(start + batch_size, n)
                 size = end - start
                 t0 = time.perf_counter()
@@ -299,15 +471,23 @@ def _produce_raw_batches(
                     dtype=torch.uint8,
                     pin_memory=True,
                 )
-                futures = [
-                    pool.submit(
-                        _read_raw_patch_into,
-                        images[i],
-                        int(coords_l0[start + i, 0]),
-                        int(coords_l0[start + i, 1]),
+
+                # One chunk per parser thread instead of one Future per tile.
+                n_chunks = min(parser_threads, size)
+                chunk_size = math.ceil(size / n_chunks)
+                futures = []
+                for local_start in range(0, size, chunk_size):
+                    local_end = min(local_start + chunk_size, size)
+                    futures.append(
+                        pool.submit(
+                            _read_physical_tile_chunk,
+                            images,
+                            coords_l0,
+                            start,
+                            local_start,
+                            local_end,
+                        )
                     )
-                    for i in range(size)
-                ]
                 for fut in futures:
                     fut.result()
 
@@ -447,7 +627,6 @@ def _validate_alignment(
 
     ref_cpu = _cpu_reference_preprocess(raw_cpu, n)
     new_cpu = gpu_uint8[:n].detach().cpu()
-
     diff = (ref_cpu.to(torch.int16) - new_cpu.to(torch.int16)).abs()
 
     ref_gpu = ref_cpu.pin_memory().to(device=device, non_blocking=True)
@@ -511,6 +690,7 @@ def save_feature_file(
         "tile_size_20x": RESIZE_SIZE,
         "model_input_size": MODEL_INPUT_SIZE,
         "level0_read_size": LEVEL0_READ_SIZE,
+        "reader": "direct_tiff_physical_tile",
     }
     torch.save(payload, tmp)
     os.replace(tmp, output)
@@ -604,6 +784,9 @@ def run_one_wsi(
             "producer_decode_s": 0.0,
             "gpu_step_s": 0.0,
         }, False
+
+    # Strictly validate the entire WSI/coordinate set before any extraction starts.
+    _validate_direct_tiff_source(task.slide_path, coords_l0)
 
     batch_q: queue.Queue = queue.Queue(maxsize=cfg.queue_batches)
     producer_stop = threading.Event()
@@ -730,12 +913,8 @@ def run_one_wsi(
                         no_more_batches = True
                     else:
                         if not isinstance(nxt, BatchPayload):
-                            raise TypeError(
-                                f"Unexpected queue item: {type(nxt)}"
-                            )
-                        next_staged = _stage_batch(
-                            nxt, device, preprocess_stream
-                        )
+                            raise TypeError(f"Unexpected queue item: {type(nxt)}")
+                        next_staged = _stage_batch(nxt, device, preprocess_stream)
                 except queue.Empty:
                     pass
 
@@ -950,10 +1129,7 @@ class TerminalDashboard:
             gpu: f"GPU {gpu}: loading model..." for gpu in self.gpu_ids
         }
         self.event = "event: -"
-        self.enabled = (
-            sys.stdout.isatty()
-            and os.environ.get("TERM", "") != "dumb"
-        )
+        self.enabled = sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
         self._initialized = False
         self._closed = False
         self._nlines = 2 + len(self.gpu_ids)
@@ -1055,13 +1231,9 @@ def parse_args() -> argparse.Namespace:
         "--validate-preprocess",
         type=int,
         default=8,
-        help="Alignment samples on first WSI per GPU; 0 disables",
+        help="GPU resize/crop alignment samples on first WSI per GPU; 0 disables",
     )
-    p.add_argument(
-        "--alignment-min-cosine",
-        type=float,
-        default=0.999,
-    )
+    p.add_argument("--alignment-min-cosine", type=float, default=0.999)
     p.add_argument("--compile", action="store_true", dest="compile_model")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--max-cases", type=int, default=None)
@@ -1118,6 +1290,8 @@ def main() -> None:
     print("GigaPath-Flash multi-GPU extraction", flush=True)
     print(f"  GPUs:                  {gpu_ids}", flush=True)
     print(f"  concurrent WSIs:       {len(gpu_ids)}", flush=True)
+    print(f"  reader:                direct TIFF physical JPEG tiles", flush=True)
+    print(f"  physical tile:         512x512, JPEG, strict validation", flush=True)
     print(f"  parser threads / WSI:  {args.parser_threads}", flush=True)
     print(
         f"  total parser threads:  {args.parser_threads * len(gpu_ids)}",
@@ -1259,9 +1433,7 @@ def main() -> None:
             elif kind == "task_error":
                 dashboard.finished += 1
                 dashboard.failed += 1
-                text = (
-                    f"GPU {gpu} ERROR {msg['case_id']}: {msg['error']}"
-                )
+                text = f"GPU {gpu} ERROR {msg['case_id']}: {msg['error']}"
                 dashboard.set_gpu(gpu, text)
                 dashboard.set_event(text)
                 dashboard.plain(text)
