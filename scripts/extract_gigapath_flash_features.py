@@ -48,7 +48,6 @@ from PIL import Image
 
 
 MODEL_REPO = "prov-gigapath/prov-gigapath-flash"
-MODEL_FILENAME = "pytorch_model.bin"
 FEATURE_DIM = 384
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -661,30 +660,11 @@ def gpu_worker(
         )
 
 
-def resolve_checkpoint(checkpoint: Optional[Path]) -> Path:
-    if checkpoint is not None:
-        checkpoint = checkpoint.expanduser().resolve()
-        if not checkpoint.is_file():
-            raise FileNotFoundError(checkpoint)
-        return checkpoint
-
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError as exc:
-        raise RuntimeError(
-            "huggingface_hub is required to resolve the GigaPath-Flash checkpoint."
-        ) from exc
-
-    print(f"Resolving {MODEL_REPO}/{MODEL_FILENAME} once before GPU workers start...", flush=True)
-    try:
-        path = hf_hub_download(repo_id=MODEL_REPO, filename=MODEL_FILENAME)
-    except Exception as exc:
-        raise RuntimeError(
-            "Could not access the gated GigaPath-Flash checkpoint. Accept the model "
-            "terms on Hugging Face and authenticate with a read token, or pass "
-            "--checkpoint /path/to/pytorch_model.bin."
-        ) from exc
-    return Path(path).resolve()
+def resolve_checkpoint(checkpoint: Path) -> Path:
+    checkpoint = checkpoint.expanduser().resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Local GigaPath-Flash checkpoint not found: {checkpoint}")
+    return checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -698,7 +678,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--queue-batches", type=int, default=4, help="Bounded CPU cache depth in batches per GPU (default: 4)")
     parser.add_argument("--amp-dtype", choices=("bf16", "fp16"), default="bf16", help="GPU autocast dtype (default: bf16)")
     parser.add_argument("--feature-dtype", choices=("float16", "float32"), default="float16", help="Stored feature dtype (default: float16)")
-    parser.add_argument("--checkpoint", type=Path, default=None, help="Local GigaPath-Flash pytorch_model.bin; otherwise use HF cache/download")
+    parser.add_argument("--checkpoint", type=Path, required=True, help="Path to the local GigaPath-Flash pytorch_model.bin; network download is never attempted")
     parser.add_argument("--compile", action="store_true", dest="compile_model", help="Use torch.compile on each GPU model")
     parser.add_argument("--overwrite", action="store_true", help="Recompute cases whose output .pt already exists")
     parser.add_argument("--max-cases", type=int, default=None, help="Only process the largest N pending cases (for benchmarking)")
