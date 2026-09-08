@@ -12,6 +12,7 @@ venv/
 # Data
 data/
 datasets/
+preprocess/
 *.tif
 *.tiff
 *.svs
