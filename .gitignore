@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Data
+data/
+datasets/
+*.tif
+*.tiff
+*.svs
+*.ndpi
+
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Logs / outputs
+logs/
+outputs/
+runs/
+wandb/
