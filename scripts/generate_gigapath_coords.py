@@ -12,9 +12,9 @@ For this dataset that maps to:
 - WSI level-0 (40x): patch = stride = 512 px.
 - Tissue mask (2.5x): window = stride = 32 px.
 
-The script only reads the low-resolution tissue masks. It writes one CSV per
-slide containing both raw WSI level-0 coordinates (for image reading) and
-20x GigaPath coordinates (for the GigaPath slide encoder).
+The script reads the low-resolution tissue masks to generate coordinates. It
+also saves a low-resolution WSI thumbnail with the selected patch grid overlaid
+for visual quality control.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from typing import Iterable
 
 import numpy as np
 import tifffile
+from PIL import Image, ImageDraw
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,8 @@ class TilingConfig:
     mask_downsample: int = 16
     occupancy_threshold: float = 0.1
     mask_threshold: float = 0.0
+    overlay_max_size: int = 2048
+    save_overlay: bool = True
 
     @property
     def level0_tile_size(self) -> int:
@@ -55,6 +58,137 @@ class TilingConfig:
                 f"{self.level0_tile_size} vs {self.mask_downsample}"
             )
         return self.level0_tile_size // self.mask_downsample
+
+
+def _to_uint8_rgb(array: np.ndarray) -> np.ndarray:
+    """Convert a TIFF level array to uint8 RGB."""
+    array = np.squeeze(array)
+
+    if array.ndim == 2:
+        array = np.repeat(array[..., None], 3, axis=-1)
+    elif array.ndim == 3:
+        if array.shape[-1] in (1, 3, 4):
+            if array.shape[-1] == 1:
+                array = np.repeat(array, 3, axis=-1)
+            else:
+                array = array[..., :3]
+        elif array.shape[0] in (1, 3, 4):
+            array = np.moveaxis(array[:3], 0, -1)
+            if array.shape[-1] == 1:
+                array = np.repeat(array, 3, axis=-1)
+        else:
+            raise ValueError(f"Unsupported thumbnail shape: {array.shape}")
+    else:
+        raise ValueError(f"Unsupported thumbnail shape: {array.shape}")
+
+    if array.dtype == np.uint8:
+        return array
+
+    array = array.astype(np.float32)
+    finite = np.isfinite(array)
+    if not finite.any():
+        return np.zeros((*array.shape[:2], 3), dtype=np.uint8)
+
+    lo = float(np.percentile(array[finite], 0.5))
+    hi = float(np.percentile(array[finite], 99.5))
+    if hi <= lo:
+        hi = lo + 1.0
+    array = np.clip((array - lo) / (hi - lo), 0.0, 1.0)
+    return (array * 255.0).astype(np.uint8)
+
+
+def load_wsi_thumbnail(slide_path: Path, max_size: int) -> tuple[Image.Image, tuple[int, int]]:
+    """Read a suitable low-resolution TIFF pyramid level and return an RGB thumbnail.
+
+    Returns:
+        thumbnail: PIL RGB image with longest side <= max_size.
+        level0_size: (width, height) of the original WSI level-0.
+    """
+    with tifffile.TiffFile(slide_path) as tif:
+        levels = tif.series[0].levels
+
+        level_shapes: list[tuple[int, int, int]] = []
+        for i, level in enumerate(levels):
+            shape = level.shape
+            if len(shape) < 2:
+                continue
+            if len(shape) == 2:
+                h, w = shape
+            elif shape[-1] in (1, 3, 4):
+                h, w = shape[-3], shape[-2]
+            elif shape[0] in (1, 3, 4):
+                h, w = shape[-2], shape[-1]
+            else:
+                h, w = shape[-2], shape[-1]
+            level_shapes.append((i, int(w), int(h)))
+
+        if not level_shapes:
+            raise ValueError(f"Cannot determine TIFF pyramid dimensions: {slide_path}")
+
+        level0_w = level_shapes[0][1]
+        level0_h = level_shapes[0][2]
+
+        # Prefer the highest-resolution level that already fits near the requested
+        # thumbnail size. If all pyramid levels are larger, use the lowest level.
+        fitting = [item for item in level_shapes if max(item[1], item[2]) <= max_size]
+        if fitting:
+            chosen_idx, _, _ = max(fitting, key=lambda item: max(item[1], item[2]))
+        else:
+            chosen_idx, _, _ = min(level_shapes, key=lambda item: max(item[1], item[2]))
+
+        thumb_array = levels[chosen_idx].asarray()
+
+    thumb = Image.fromarray(_to_uint8_rgb(thumb_array), mode="RGB")
+    if max(thumb.size) > max_size:
+        scale = max_size / max(thumb.size)
+        new_size = (
+            max(1, int(round(thumb.width * scale))),
+            max(1, int(round(thumb.height * scale))),
+        )
+        thumb = thumb.resize(new_size, Image.Resampling.BILINEAR)
+
+    return thumb, (level0_w, level0_h)
+
+
+def save_patch_overlay(
+    slide_path: Path,
+    output_path: Path,
+    x_l0: np.ndarray,
+    y_l0: np.ndarray,
+    level0_tile_size: int,
+    max_size: int,
+) -> None:
+    """Save a thumbnail of the WSI with selected level-0 patch boxes overlaid."""
+    thumbnail, (level0_w, level0_h) = load_wsi_thumbnail(slide_path, max_size=max_size)
+
+    scale_x = thumbnail.width / level0_w
+    scale_y = thumbnail.height / level0_h
+
+    base = thumbnail.convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+
+    box_w = max(1, int(round(level0_tile_size * scale_x)))
+    box_h = max(1, int(round(level0_tile_size * scale_y)))
+    line_width = 1 if max(base.size) <= 1200 else 2
+
+    for x0, y0 in zip(x_l0, y_l0):
+        x1 = int(round(int(x0) * scale_x))
+        y1 = int(round(int(y0) * scale_y))
+        x2 = min(base.width - 1, x1 + box_w)
+        y2 = min(base.height - 1, y1 + box_h)
+        if x2 < 0 or y2 < 0 or x1 >= base.width or y1 >= base.height:
+            continue
+        draw.rectangle(
+            [max(0, x1), max(0, y1), x2, y2],
+            fill=(0, 255, 0, 35),
+            outline=(0, 220, 0, 220),
+            width=line_width,
+        )
+
+    composed = Image.alpha_composite(base, overlay).convert("RGB")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    composed.save(output_path, quality=90)
 
 
 def load_tissue_mask(mask_path: Path, threshold: float) -> np.ndarray:
@@ -110,6 +244,7 @@ def write_case_coords(
     mask_path: Path,
     slide_path: Path,
     output_path: Path,
+    overlay_path: Path,
     cfg: TilingConfig,
 ) -> dict:
     # The main process filters missing WSIs before submitting jobs. Keep this
@@ -163,6 +298,16 @@ def write_case_coords(
 
     tmp_path.replace(output_path)
 
+    if cfg.save_overlay:
+        save_patch_overlay(
+            slide_path=slide_path,
+            output_path=overlay_path,
+            x_l0=x_l0,
+            y_l0=y_l0,
+            level0_tile_size=cfg.level0_tile_size,
+            max_size=cfg.overlay_max_size,
+        )
+
     return {
         "case_id": case_id,
         "slide_file": slide_path.name,
@@ -188,6 +333,7 @@ def process_one(args: tuple[str, Path, Path, Path, TilingConfig]) -> dict:
         mask_path=mask_path,
         slide_path=slide_path,
         output_path=output_dir / f"{case_id}.csv",
+        overlay_path=output_dir / "overlays" / f"{case_id}.jpg",
         cfg=cfg,
     )
 
@@ -233,6 +379,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recursive", action="store_true", help="Search for *_tissue.tif recursively")
     parser.add_argument("--occupancy-threshold", type=float, default=0.1, help="Keep tiles with tissue ratio > threshold (default: 0.1)")
     parser.add_argument("--mask-threshold", type=float, default=0.0, help="Mask pixels > threshold are tissue (default: 0)")
+    parser.add_argument("--overlay-max-size", type=int, default=2048, help="Maximum side length of overlay thumbnails (default: 2048)")
+    parser.add_argument("--no-overlay", action="store_true", help="Do not generate WSI patch overlay thumbnails")
     return parser.parse_args()
 
 
@@ -245,10 +393,14 @@ def main() -> None:
         raise ValueError("--occupancy-threshold must be in [0, 1]")
     if args.workers < 1:
         raise ValueError("--workers must be >= 1")
+    if args.overlay_max_size < 256:
+        raise ValueError("--overlay-max-size must be >= 256")
 
     cfg = TilingConfig(
         occupancy_threshold=args.occupancy_threshold,
         mask_threshold=args.mask_threshold,
+        overlay_max_size=args.overlay_max_size,
+        save_overlay=not args.no_overlay,
     )
 
     discovered_cases = list(iter_cases(args.data_dir, recursive=args.recursive))
@@ -262,6 +414,8 @@ def main() -> None:
     cases = [case for case in discovered_cases if case[2].is_file()]
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.save_overlay:
+        (args.output_dir / "overlays").mkdir(parents=True, exist_ok=True)
 
     print("GigaPath coordinate generation")
     print(f"  tissue masks found:  {len(discovered_cases)}")
@@ -272,6 +426,7 @@ def main() -> None:
     print(f"  tissue-mask window:  {cfg.mask_tile_size}px (downsample={cfg.mask_downsample}x)")
     print(f"  stride:              same as tile size (non-overlapping)")
     print(f"  occupancy:           > {cfg.occupancy_threshold}")
+    print(f"  overlays:            {'enabled' if cfg.save_overlay else 'disabled'}")
 
     for case_id, _, slide_path in missing_cases:
         print(f"[SKIP] {case_id}: missing WSI {slide_path}")
@@ -315,6 +470,8 @@ def main() -> None:
     print(f"\nFinished: {len(rows)}/{len(cases)} available slides, {total_tiles} tiles")
     print(f"Skipped missing WSI: {len(missing_cases)}")
     print(f"Coordinates: {args.output_dir}")
+    if cfg.save_overlay:
+        print(f"Overlays:    {args.output_dir / 'overlays'}")
     print(f"Summary:     {args.output_dir / 'summary.csv'}")
 
     if errors:
