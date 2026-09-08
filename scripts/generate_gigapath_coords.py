@@ -112,6 +112,8 @@ def write_case_coords(
     output_path: Path,
     cfg: TilingConfig,
 ) -> dict:
+    # The main process filters missing WSIs before submitting jobs. Keep this
+    # check as a safeguard in case a file disappears while the script is running.
     if not slide_path.is_file():
         raise FileNotFoundError(f"Missing WSI for {case_id}: {slide_path}")
 
@@ -249,19 +251,30 @@ def main() -> None:
         mask_threshold=args.mask_threshold,
     )
 
-    cases = list(iter_cases(args.data_dir, recursive=args.recursive))
-    if not cases:
+    discovered_cases = list(iter_cases(args.data_dir, recursive=args.recursive))
+    if not discovered_cases:
         raise RuntimeError(f"No *_tissue.tif files found in {args.data_dir}")
+
+    # A tissue mask may arrive before its corresponding WSI during dataset sync.
+    # Missing WSIs are expected in that situation, so skip them rather than
+    # treating them as processing failures.
+    missing_cases = [case for case in discovered_cases if not case[2].is_file()]
+    cases = [case for case in discovered_cases if case[2].is_file()]
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     print("GigaPath coordinate generation")
-    print(f"  cases:               {len(cases)}")
+    print(f"  tissue masks found:  {len(discovered_cases)}")
+    print(f"  cases with WSI:      {len(cases)}")
+    print(f"  missing WSI skipped: {len(missing_cases)}")
     print(f"  target:              {cfg.target_tile_size}px @ {cfg.target_magnification:g}x")
     print(f"  WSI level-0 tile:    {cfg.level0_tile_size}px @ {cfg.level0_magnification:g}x")
     print(f"  tissue-mask window:  {cfg.mask_tile_size}px (downsample={cfg.mask_downsample}x)")
     print(f"  stride:              same as tile size (non-overlapping)")
     print(f"  occupancy:           > {cfg.occupancy_threshold}")
+
+    for case_id, _, slide_path in missing_cases:
+        print(f"[SKIP] {case_id}: missing WSI {slide_path}")
 
     jobs = [
         (case_id, mask_path, slide_path, args.output_dir, cfg)
@@ -299,7 +312,8 @@ def main() -> None:
     save_summary(rows, args.output_dir, cfg)
 
     total_tiles = sum(row["num_tiles"] for row in rows)
-    print(f"\nFinished: {len(rows)}/{len(cases)} slides, {total_tiles} tiles")
+    print(f"\nFinished: {len(rows)}/{len(cases)} available slides, {total_tiles} tiles")
+    print(f"Skipped missing WSI: {len(missing_cases)}")
     print(f"Coordinates: {args.output_dir}")
     print(f"Summary:     {args.output_dir / 'summary.csv'}")
 
